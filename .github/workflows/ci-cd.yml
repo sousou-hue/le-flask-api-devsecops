@@ -10,6 +10,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   AWS_REGION: 'us-east-1'
 
+
 jobs:
   #  JOB 1 : INTÉGRATION CONTINUE AVEC SÉCURITÉ hhh
   continuous-integration:
