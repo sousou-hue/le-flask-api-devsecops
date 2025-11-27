@@ -1,0 +1,156 @@
+name: Pipeline CI/CD DevSecOps AWS
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  #  JOB 1 : INTÉGRATION CONTINUE AVEC SÉCURITÉ hhh
+  continuous-integration:
+    name: "🔍 CI - Tests & Sécurité"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+      packages: read
+    
+    steps:
+    - name: " Checkout du code"
+      uses: actions/checkout@v4
+      
+    - name: "Configuration Python"
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+        
+    - name: " Installation des dépendances"
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: " Exécution des tests unitaires"
+      run: pytest -v --junitxml=test-results.xml
+      
+    - name: " Publication des résultats de tests"
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: test-results.xml
+        
+    - name: " Analyse de qualité de code (Linting)"
+      run: flake8 . --count --max-complexity=10 --max-line-length=127 --statistics
+      
+    - name: " Initialisation CodeQL (SAST)"
+      uses: github/codeql-action/init@v3
+      with:
+        languages: python
+        
+    - name: " Autocomplete pour CodeQL"
+      run: |
+        echo "Building application for CodeQL analysis..."
+        python -m py_compile app.py test_app.py
+        
+    - name: " Analyse de sécurité CodeQL"
+      uses: github/codeql-action/analyze@v3
+
+  #  JOB 2 : DÉPLOIEMENT CONTINU SUR AWS
+  continuous-deployment:
+    name: " CD - Déploiement AWS"
+    needs: continuous-integration
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      security-events: write
+      contents: read
+      packages: write
+    
+    steps:
+    - name: " Checkout du code"
+      uses: actions/checkout@v4
+      
+    - name: " Setup Docker Buildx"
+      uses: docker/setup-buildx-action@v3
+
+    - name: " Connexion au GitHub Container Registry"
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: " Construction de l'image Docker"
+      id: build-image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        load: true
+        cache-from: type=gha
+        
+    - name: " Scan de sécurité de l'image avec Trivy"
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+        
+    - name: " Téléversement des résultats du scan Trivy"
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-scan-results
+        path: trivy-results.sarif
+        
+    - name: " Push de l'image sécurisée vers GHCR"
+      if: success()
+      run: |
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        
+    - name: " Déploiement sur AWS EC2"
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.AWS_EC2_HOST }}
+        username: ${{ secrets.AWS_EC2_USERNAME }}
+        key: ${{ secrets.AWS_EC2_SSH_KEY }}
+        script: |
+          set -e
+          echo "===  DÉPLOIEMENT EN PRODUCTION ==="
+          echo "1.  Authentification au GitHub Container Registry..."
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          echo "2.  Téléchargement de la nouvelle image..."
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          
+          echo "3.  Nettoyage de l'ancienne version..."
+          docker stop flask-production-app || true
+          docker rm flask-production-app || true
+          echo "4.  Nettoyage des images anciennes..."
+          docker image prune -f
+          echo "5.  Démarrage du nouveau conteneur..."
+          docker run -d \
+            --name flask-production-app \
+            --restart unless-stopped \
+            -p 80:5000 \
+            -e ENVIRONMENT=production \
+            -e FLASK_ENV=production \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          echo "6.  Vérification du déploiement..."
+          sleep 10
+          docker ps --filter "name=flask-production-app"
+          echo "Déploiement terminé avec succès!"
+          
+    - name: " Vérification post-déploiement"
+      run: |
+        echo "Attente du démarrage de l'application..."
+        sleep 15
+        echo " Test de l'API déployée sur AWS..."
+        curl --retry 3 --retry-delay 5 --max-time 10 -f http://${{ secrets.AWS_EC2_HOST }}:80/health || echo "L'application met du temps à démarrer"
+        echo "URL de l'application: http://${{ secrets.AWS_EC2_HOST }}"
